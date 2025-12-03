@@ -22,7 +22,7 @@
 # SOFTWARE.
 #
 # Tool to interact with ADIDNS over LDAP
-# 
+#
 ####################
 import sys
 import argparse
@@ -30,13 +30,14 @@ import getpass
 import re
 import os
 import socket
+import ssl
 from struct import unpack, pack
 from impacket.structure import Structure
 from impacket.krb5.ccache import CCache
 from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
 from impacket.krb5.types import Principal
 from impacket.krb5 import constants
-from ldap3 import NTLM, Server, Connection, ALL, LEVEL, BASE, MODIFY_DELETE, MODIFY_ADD, MODIFY_REPLACE, SASL, KERBEROS
+from ldap3 import NTLM, Server, Connection, ALL, LEVEL, BASE, MODIFY_DELETE, MODIFY_ADD, MODIFY_REPLACE, SASL, KERBEROS, Tls, SIMPLE
 from lib.utils.kerberos import ldap_kerberos
 import ldap3
 from impacket.ldap import ldaptypes
@@ -243,14 +244,14 @@ def get_next_serial(dnsserver, dc, zone, tcp):
        server = dnsserver
     else:
         server = dc
-   
+
 
     # Is our host an IP? In that case make sure the server IP is used
     # if not assume lookups are working already
     try:
         socket.inet_aton(server)
         dnsresolver.nameservers = [server]
-        
+
     except socket.error:
         pass
     res = dnsresolver.resolve(zone, 'SOA',tcp=tcp)
@@ -334,7 +335,6 @@ def main():
     parser._positionals.title = "Required options"
 
     #Main parameters
-    #maingroup = parser.add_argument_group("Main options")
     parser.add_argument("host", type=str,metavar='HOSTNAME',help="Hostname/ip or ldap://host:port connection string to connect to")
     parser.add_argument("-u","--user",type=str,metavar='USERNAME',help="DOMAIN\\username for authentication.")
     parser.add_argument("-p","--password",type=str,metavar='PASSWORD',help="Password or LM:NTLM hash, will prompt if not specified")
@@ -373,14 +373,22 @@ def main():
 
     args = parser.parse_args()
 
-    #Prompt for password if not set
+    # Prompt for password if not set
     authentication = None
-    if not args.user or not '\\' in args.user:
+    sasl_mech = None
+
+    if not args.user or '\\' not in args.user:
         print_f('Username must include a domain, use: DOMAIN\\username')
         sys.exit(1)
+
     domain, user = args.user.split('\\', 1)
+    bind_user = args.user  # default for Kerberos path
+
     if not args.kerberos:
-        authentication = NTLM
+        # SIMPLE bind over TLS (like ldapsearch -x -ZZ)
+        # For simple bind, use UPN-style username
+        bind_user = f"{user}@{domain}"
+        authentication = SIMPLE
         sasl_mech = None
         if args.password is None:
             args.password = getpass.getpass()
@@ -422,18 +430,50 @@ def main():
         sasl_mech = KERBEROS
 
     # define the server and the connection
-    s = Server(args.host, port=args.port, use_ssl=args.force_ssl, get_info=ALL)
+    # TLS config: accept ANY certificate (like TLS_REQCERT=never)
+    tls_config = Tls(
+        validate=ssl.CERT_NONE
+        # optionally: version=ssl.PROTOCOL_TLS_CLIENT
+    )
+
+    # If -force-ssl is set: use LDAPS (SSL from first byte, e.g. port 636)
+    # Otherwise: connect on args.port (default 389) and upgrade via StartTLS
+    s = Server(
+        args.host,
+        port=args.port,
+        use_ssl=args.force_ssl,
+        tls=tls_config,
+        get_info=ALL
+    )
+
     print_m('Connecting to host...')
-    c = Connection(s, user=args.user, password=args.password, authentication=authentication, sasl_mechanism=sasl_mech)
+    c = Connection(
+        s,
+        user=bind_user,
+        password=args.password,
+        authentication=authentication,
+        sasl_mechanism=sasl_mech
+    )
+
+    # If not using LDAPS, explicitly start TLS
+    if not args.force_ssl:
+        print_m('Starting TLS (StartTLS)...')
+        if not c.start_tls():
+            print_f('Could not establish TLS: %s' % c.result)
+            sys.exit(1)
+
     print_m('Binding to host')
     # perform the Bind operation
-    if authentication == NTLM:
+    if not args.kerberos:
+        # SIMPLE bind over TLS
         if not c.bind():
             print_f('Could not bind with specified credentials')
             print_f(c.result)
             sys.exit(1)
     else:
+        # Kerberos (SASL/GSSAPI) over TLS or LDAPS
         ldap_kerberos(domain, kdcHost, None, userName, c, args.host, TGS)
+
     print_o('Bind OK')
     domainroot = s.info.other['defaultNamingContext'][0]
     forestroot = s.info.other['rootDomainNamingContext'][0]
@@ -463,7 +503,7 @@ def main():
                 print('    %s' % zone)
         return
 
-    
+
     target = args.record
     if args.zone:
         zone = args.zone
@@ -492,7 +532,7 @@ def main():
     if args.action in ['add', 'modify', 'remove'] and not args.data:
         print_f('This operation requires you to specify record data with --data')
         return
-    
+
 
     # Check if we need the target record to exists, and if yes if it does
     if args.action in ['modify', 'remove', 'ldapdelete', 'resurrect', 'query'] and not targetentry:
